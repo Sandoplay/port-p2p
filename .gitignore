@@ -2,3 +2,4 @@
 .idea/modules.xml
 go.sum
 libp2p_android
+linux-env-android.txt

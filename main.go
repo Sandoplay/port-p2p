@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -112,6 +113,11 @@ func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routi
 }
 
 func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
+	node.SetStreamHandler(protocol.ID("/p2p-tunnel/hello"), func(s network.Stream) {
+		fmt.Printf("\n>>> ВАШ ДРУГ ПІДКЛЮЧИВСЯ! (Peer ID: %s)\n", s.Conn().RemotePeer())
+		s.Close()
+	})
+
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
 		protoID := protocol.ID(fmt.Sprintf("/p2p-tunnel/%s/%s", networkType, port))
@@ -120,12 +126,15 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 			targetAddr := fmt.Sprintf("127.0.0.1:%s", port)
 			localConn, err := net.Dial(networkType, targetAddr)
 			if err != nil {
-				log.Printf("Відмова підключення до %s (%s): %s", port, networkType, err)
+				log.Printf("Відмова підключення до %s: %s", port, err)
 				s.Reset()
 				return
 			}
-			log.Printf("Новий потік: %s -> %s", s.Conn().RemotePeer(), targetAddr)
-			go syncStreams(localConn, s)
+			if networkType == "udp" {
+				go syncFramedStreams(localConn, s)
+			} else {
+				go syncStreams(localConn, s)
+			}
 		})
 	}
 
@@ -139,9 +148,14 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 
 func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
 	fmt.Printf("\n=== КЛІЄНТ ЗАПУЩЕНО ===\n")
-
 	targetPeer := establishSymmetricConnection(ctx, node, rd, secret)
 	fmt.Printf("З'ЄДНАННЯ ВСТАНОВЛЕНО (Peer ID: %s)\n", targetPeer)
+
+	// Відправка сигналу серверу
+	s, err := node.NewStream(ctx, targetPeer, protocol.ID("/p2p-tunnel/hello"))
+	if err == nil {
+		s.Close()
+	}
 
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
@@ -203,20 +217,30 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 				sessions[addrStr] = s
 
 				go func(remoteAddr net.Addr, stream network.Stream) {
-					respBuf := make([]byte, 65535)
+					lenBuf := make([]byte, 2)
 					for {
-						rn, err := stream.Read(respBuf)
-						if err != nil {
+						if _, err := io.ReadFull(stream, lenBuf); err != nil {
 							mu.Lock()
 							delete(sessions, remoteAddr.String())
 							mu.Unlock()
 							return
 						}
-						ln.WriteTo(respBuf[:rn], remoteAddr)
+						length := binary.BigEndian.Uint16(lenBuf)
+						dataBuf := make([]byte, length)
+						if _, err := io.ReadFull(stream, dataBuf); err != nil {
+							mu.Lock()
+							delete(sessions, remoteAddr.String())
+							mu.Unlock()
+							return
+						}
+						ln.WriteTo(dataBuf, remoteAddr)
 					}
 				}(addr, s)
 			}
 			mu.Unlock()
+			lenBuf := make([]byte, 2)
+			binary.BigEndian.PutUint16(lenBuf, uint16(n))
+			s.Write(lenBuf)
 			s.Write(buf[:n])
 		}
 	}
@@ -245,4 +269,44 @@ func bootstrap(ctx context.Context, node host.Host) {
 		pi, _ := peer.AddrInfoFromP2pAddr(addr)
 		node.Connect(ctx, *pi)
 	}
+}
+
+func syncFramedStreams(conn net.Conn, stream network.Stream) {
+	defer conn.Close()
+	defer stream.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 65535)
+		lenBuf := make([]byte, 2)
+		for {
+			n, err := conn.Read(buf)
+			if err != nil {
+				return
+			}
+			binary.BigEndian.PutUint16(lenBuf, uint16(n))
+			stream.Write(lenBuf)
+			stream.Write(buf[:n])
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		lenBuf := make([]byte, 2)
+		for {
+			if _, err := io.ReadFull(stream, lenBuf); err != nil {
+				return
+			}
+			length := binary.BigEndian.Uint16(lenBuf)
+			dataBuf := make([]byte, length)
+			if _, err := io.ReadFull(stream, dataBuf); err != nil {
+				return
+			}
+			conn.Write(dataBuf)
+		}
+	}()
+
+	wg.Wait()
 }
