@@ -2,27 +2,56 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routingDiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	discoveryUtil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
 
 const DefaultPorts = "tcp:47984,tcp:47989,tcp:47990,tcp:48010,udp:47998,udp:47999,udp:48000"
+
+type mdnsNotifee struct {
+	peerChan chan peer.AddrInfo
+}
+
+func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	m.peerChan <- pi
+}
+
+func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
+	b, err := os.ReadFile(path)
+	if err == nil {
+		return crypto.UnmarshalPrivateKey(b)
+	}
+	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.Ed25519, 2048, rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	b, err = crypto.MarshalPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	err = os.WriteFile(path, b, 0600)
+	return priv, err
+}
 
 func main() {
 	isHost := flag.Bool("host", false, "Працювати як сервер (Sunshine)")
@@ -38,9 +67,20 @@ func main() {
 		log.Fatal("Потрібно вказати рівно один прапор: -host або -client")
 	}
 
+	keyFile := "client_key.dat"
+	if *isHost {
+		keyFile = "host_key.dat"
+	}
+
+	priv, err := loadOrGenerateKey(keyFile)
+	if err != nil {
+		log.Fatalf("Помилка ініціалізації криптографічного ключа: %s", err)
+	}
+
 	ctx := context.Background()
 
 	node, err := libp2p.New(
+		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(
 			"/ip4/0.0.0.0/tcp/0",
 			"/ip4/0.0.0.0/udp/0/quic-v1",
@@ -57,6 +97,12 @@ func main() {
 
 	log.Printf("Локальний Peer ID: %s", node.ID())
 
+	mdnsChan := make(chan peer.AddrInfo, 10)
+	mdnsService := mdns.NewMdnsService(node, *rendezvous, &mdnsNotifee{peerChan: mdnsChan})
+	if err := mdnsService.Start(); err != nil {
+		log.Printf("Помилка ініціалізації локального пошуку: %s", err)
+	}
+
 	kDHT, err := dht.New(ctx, node, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
 		log.Fatal(err)
@@ -71,68 +117,94 @@ func main() {
 	portList := strings.Split(*portsFlag, ",")
 
 	if *isHost {
-		setupHost(ctx, node, rDiscovery, *rendezvous, portList)
+		setupHost(ctx, node, rDiscovery, *rendezvous, portList, mdnsChan)
 	} else {
-		setupClient(ctx, node, rDiscovery, *rendezvous, portList)
+		setupClient(ctx, node, rDiscovery, *rendezvous, portList, mdnsChan)
 	}
 }
 
-func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string) peer.ID {
+func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, mdnsPeers <-chan peer.AddrInfo) peer.ID {
 	log.Printf("Початок публікації та пошуку за ідентифікатором: %s", secret)
 	discoveryUtil.Advertise(ctx, rd, secret)
 
 	var targetPeer peer.ID
-	attempt := 1
+	successChan := make(chan peer.ID, 1)
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	for targetPeer == "" {
-		log.Printf("[Спроба %d] Запит FindPeers...", attempt)
-		peerChan, err := rd.FindPeers(ctx, secret)
-		if err != nil {
-			log.Printf("[Спроба %d] Помилка FindPeers: %v", attempt, err)
-			time.Sleep(2 * time.Second)
-			attempt++
-			continue
+	var wg sync.WaitGroup
+
+	dialPeer := func(p peer.AddrInfo) {
+		if p.ID == node.ID() || len(p.Addrs) == 0 {
+			return
 		}
 
-		peersFound := 0
-		for p := range peerChan {
-			if p.ID == node.ID() {
-				continue
-			}
-			peersFound++
-			log.Printf("Знайдено вузол: %s. Доступні адреси: %v", p.ID, p.Addrs)
+		wg.Add(1)
+		go func(pi peer.AddrInfo) {
+			defer wg.Done()
+			log.Printf("Спроба підключення до %s...", pi.ID)
+			ctxConn, cancelConn := context.WithTimeout(dialCtx, 7*time.Second)
+			defer cancelConn()
 
-			if len(p.Addrs) == 0 {
-				log.Printf("Вузол %s ігнорується (відсутні адреси для підключення)", p.ID)
-				continue
-			}
-
-			log.Printf("Спроба підключення до %s (таймаут 7 сек)...", p.ID)
-			ctxConn, cancel := context.WithTimeout(ctx, 7*time.Second)
-			err := node.Connect(ctxConn, p)
-			cancel()
-
+			err := node.Connect(ctxConn, pi)
 			if err == nil {
-				log.Printf("УСПІХ: Зв'язок на транспортному рівні з %s встановлено", p.ID)
-				targetPeer = p.ID
-				break
+				select {
+				case successChan <- pi.ID:
+				default:
+				}
 			} else {
-				log.Printf("ПОМИЛКА підключення до %s: %v", p.ID, err)
+				log.Printf("Відмова підключення до %s: %v", pi.ID, err)
 			}
-		}
+		}(p)
+	}
 
-		if targetPeer == "" {
-			log.Printf("[Спроба %d] Завершено ітерацію. Оброблено знайдених вузлів: %d. Пауза перед повтором...", attempt, peersFound)
+	go func() {
+		attempt := 1
+		for {
+			select {
+			case <-dialCtx.Done():
+				return
+			default:
+			}
+
+			log.Printf("[Спроба %d] Запит глобального пошуку вузлів...", attempt)
+			peerChan, err := rd.FindPeers(dialCtx, secret)
+			if err == nil {
+				for p := range peerChan {
+					dialPeer(p)
+				}
+			}
 			time.Sleep(2 * time.Second)
 			attempt++
 		}
+	}()
+
+	go func() {
+		for p := range mdnsPeers {
+			select {
+			case <-dialCtx.Done():
+				return
+			default:
+				log.Printf("Знайдено локальний вузол: %s", p.ID)
+				dialPeer(p)
+			}
+		}
+	}()
+
+	select {
+	case targetPeer = <-successChan:
+		log.Printf("УСПІХ: Зв'язок на транспортному рівні з %s встановлено", targetPeer)
+		cancel()
+	case <-ctx.Done():
+		log.Printf("Процес ініціалізації перервано")
 	}
+
 	return targetPeer
 }
 
-func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
+func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string, mdnsPeers <-chan peer.AddrInfo) {
 	node.SetStreamHandler(protocol.ID("/p2p-tunnel/hello"), func(s network.Stream) {
-		fmt.Printf("\n>>> ВАШ ДРУГ ПІДКЛЮЧИВСЯ! (Peer ID: %s)\n", s.Conn().RemotePeer())
+		fmt.Printf("\n>>> З'ЄДНАННЯ ПІДТВЕРДЖЕНО (Peer ID: %s)\n", s.Conn().RemotePeer())
 		s.Close()
 	})
 
@@ -144,7 +216,7 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 			targetAddr := fmt.Sprintf("127.0.0.1:%s", port)
 			localConn, err := net.Dial(networkType, targetAddr)
 			if err != nil {
-				log.Printf("Відмова підключення до %s: %s", port, err)
+				log.Printf("Відмова локального підключення до %s: %s", port, err)
 				s.Reset()
 				return
 			}
@@ -158,18 +230,17 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 
 	fmt.Printf("\n=== СЕРВЕР ЗАПУЩЕНО ===\nКонфігурація портів: %v\n", ports)
 
-	targetPeer := establishSymmetricConnection(ctx, node, rd, secret)
-	log.Printf("З'ЄДНАННЯ ВСТАНОВЛЕНО (Peer ID: %s)", targetPeer)
+	targetPeer := establishSymmetricConnection(ctx, node, rd, secret, mdnsPeers)
+	log.Printf("ТУНЕЛЬ АКТИВНО (Peer ID: %s)", targetPeer)
 
 	select {}
 }
 
-func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
+func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string, mdnsPeers <-chan peer.AddrInfo) {
 	fmt.Printf("\n=== КЛІЄНТ ЗАПУЩЕНО ===\n")
-	targetPeer := establishSymmetricConnection(ctx, node, rd, secret)
-	fmt.Printf("З'ЄДНАННЯ ВСТАНОВЛЕНО (Peer ID: %s)\n", targetPeer)
+	targetPeer := establishSymmetricConnection(ctx, node, rd, secret, mdnsPeers)
+	fmt.Printf("ТУНЕЛЬ АКТИВНО (Peer ID: %s)\n", targetPeer)
 
-	// Відправка сигналу серверу
 	s, err := node.NewStream(ctx, targetPeer, protocol.ID("/p2p-tunnel/hello"))
 	if err == nil {
 		s.Close()
@@ -181,7 +252,7 @@ func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.Routi
 		go startLocalListener(ctx, node, targetPeer, networkType, port, protoID)
 	}
 
-	fmt.Printf("\n=== ТУНЕЛЬ ГОТОВИЙ ===\nДоступно для підключення за адресою 127.0.0.1\n")
+	fmt.Printf("\n=== МАРШРУТИЗАЦІЯ ГОТОВА ===\nІнтерфейс доступу: 127.0.0.1\n")
 	select {}
 }
 

@@ -3,3 +3,8 @@
 go.sum
 libp2p_android
 linux-env-android.txt
+client_key.dat
+go.sum
+host_key.dat
+.gitignore
+main.exe
