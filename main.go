@@ -21,18 +21,17 @@ import (
 	discoveryUtil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
 
-// Стандартні порти для Moonlight/Sunshine
 const DefaultPorts = "tcp:47984,tcp:47989,tcp:47990,tcp:48010,udp:47998,udp:47999,udp:48000"
 
 func main() {
-	isHost := flag.Bool("host", false, "Працювати як сервер (Sunshine/Game PC)")
-	isClient := flag.Bool("client", false, "Працювати як клієнт (Moonlight PC)")
-	rendezvous := flag.String("secret", "", "Унікальний секретний пароль (однаковий у обох)")
-	portsFlag := flag.String("ports", DefaultPorts, "Список портів (напр. tcp:80,udp:123)")
+	isHost := flag.Bool("host", false, "Працювати як сервер (Sunshine)")
+	isClient := flag.Bool("client", false, "Працювати як клієнт (Moonlight)")
+	rendezvous := flag.String("secret", "", "Унікальний секретний ідентифікатор")
+	portsFlag := flag.String("ports", DefaultPorts, "Список портів")
 	flag.Parse()
 
 	if *rendezvous == "" {
-		log.Fatal("Будь ласка, вкажіть -secret")
+		log.Fatal("Потрібно вказати -secret")
 	}
 	if (!*isHost && !*isClient) || (*isHost && *isClient) {
 		log.Fatal("Потрібно вказати рівно один прапор: -host або -client")
@@ -40,26 +39,24 @@ func main() {
 
 	ctx := context.Background()
 
-	// Ініціалізація libp2p вузла
 	node, err := libp2p.New(
 		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/0",         // Стандартний TCP
-			"/ip4/0.0.0.0/udp/0/quic-v1", // QUIC - критично для пробиття NAT
+			"/ip4/0.0.0.0/tcp/0",
+			"/ip4/0.0.0.0/udp/0/quic-v1",
 		),
 		libp2p.NATPortMap(),
-		libp2p.EnableRelay(),        // Дозволяє використовувати публічні релеї
-		libp2p.EnableHolePunching(), // Намагається встановити пряме з'єднання
-		libp2p.EnableNATService(),   // ПРАВИЛЬНА НАЗВА замість EnableAutoNAT
+		libp2p.EnableRelay(),
+		libp2p.EnableHolePunching(),
+		libp2p.EnableAutoNATv2(),
 	)
 	if err != nil {
 		log.Fatalf("Помилка створення вузла: %s", err)
 	}
 	defer node.Close()
 
-	log.Printf("Ваш Peer ID: %s", node.ID())
+	log.Printf("Локальний Peer ID: %s", node.ID())
 
-	// Налаштування DHT для пошуку один одного
-	kDHT, err := dht.New(ctx, node, dht.Mode(dht.ModeAuto))
+	kDHT, err := dht.New(ctx, node, dht.Mode(dht.ModeAutoServer))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,7 +64,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Підключаємось до стандартних бутстрап-вузлів
 	bootstrap(ctx, node)
 
 	rDiscovery := routingDiscovery.NewRoutingDiscovery(kDHT)
@@ -80,6 +76,41 @@ func main() {
 	}
 }
 
+func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string) peer.ID {
+	fmt.Printf("Публікація та пошук у мережі за ідентифікатором '%s'...\n", secret)
+
+	discoveryUtil.Advertise(ctx, rd, secret)
+
+	var targetPeer peer.ID
+	for targetPeer == "" {
+		peerChan, err := rd.FindPeers(ctx, secret)
+		if err != nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		for p := range peerChan {
+			if p.ID == node.ID() || len(p.Addrs) == 0 {
+				continue
+			}
+
+			ctxConn, cancel := context.WithTimeout(ctx, 7*time.Second)
+			err := node.Connect(ctxConn, p)
+			cancel()
+
+			if err == nil {
+				targetPeer = p.ID
+				break
+			}
+		}
+
+		if targetPeer == "" {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	return targetPeer
+}
+
 func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
@@ -89,53 +120,28 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 			targetAddr := fmt.Sprintf("127.0.0.1:%s", port)
 			localConn, err := net.Dial(networkType, targetAddr)
 			if err != nil {
-				log.Printf("Не вдалося підключитися до локального порту %s (%s): %s", port, networkType, err)
+				log.Printf("Відмова підключення до %s (%s): %s", port, networkType, err)
 				s.Reset()
 				return
 			}
-			log.Printf("Нове з'єднання: %s -> %s", s.Conn().RemotePeer(), targetAddr)
+			log.Printf("Новий потік: %s -> %s", s.Conn().RemotePeer(), targetAddr)
 			go syncStreams(localConn, s)
 		})
 	}
 
-	discoveryUtil.Advertise(ctx, rd, secret)
-	fmt.Printf("\n=== СЕРВЕР ЗАПУЩЕНО ===\nСекрет: %s\nПрокидаємо порти: %v\nЧекаємо на клієнта...\n", secret, ports)
+	fmt.Printf("\n=== СЕРВЕР ЗАПУЩЕНО ===\nКонфігурація портів: %v\n", ports)
 
-	// Додаємо сповіщення про підключення пірів
-	node.Network().Notify(&network.NotifyBundle{
-		ConnectedF: func(n network.Network, c network.Conn) {
-			log.Printf(">>> Пір підключився до вас: %s", c.RemotePeer())
-		},
-	})
+	targetPeer := establishSymmetricConnection(ctx, node, rd, secret)
+	log.Printf("З'ЄДНАННЯ ВСТАНОВЛЕНО (Peer ID: %s)", targetPeer)
 
 	select {}
 }
 
 func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
-	fmt.Printf("Шукаємо друга із секретом '%s'...\n", secret)
-	var targetPeer peer.ID
+	fmt.Printf("\n=== КЛІЄНТ ЗАПУЩЕНО ===\n")
 
-	// Цикл пошуку піра
-	for targetPeer == "" {
-		peerChan, err := rd.FindPeers(ctx, secret)
-		if err != nil {
-			log.Fatal(err)
-		}
-		for p := range peerChan {
-			if p.ID == node.ID() || len(p.Addrs) == 0 {
-				continue
-			}
-			if err := node.Connect(ctx, p); err == nil {
-				targetPeer = p.ID
-				break
-			}
-		}
-		if targetPeer == "" {
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	fmt.Printf("Підключено до друга! (ID: %s)\n", targetPeer)
+	targetPeer := establishSymmetricConnection(ctx, node, rd, secret)
+	fmt.Printf("З'ЄДНАННЯ ВСТАНОВЛЕНО (Peer ID: %s)\n", targetPeer)
 
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
@@ -143,7 +149,7 @@ func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.Routi
 		go startLocalListener(ctx, node, targetPeer, networkType, port, protoID)
 	}
 
-	fmt.Printf("\n=== ТУНЕЛЬ ГОТОВИЙ ===\nТепер ви можете підключатися до 127.0.0.1 у Moonlight\n")
+	fmt.Printf("\n=== ТУНЕЛЬ ГОТОВИЙ ===\nДоступно для підключення за адресою 127.0.0.1\n")
 	select {}
 }
 
@@ -151,7 +157,7 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 	if networkType == "tcp" {
 		ln, err := net.Listen("tcp", "127.0.0.1:"+port)
 		if err != nil {
-			log.Printf("Помилка прослуховування TCP %s: %s", port, err)
+			log.Printf("Помилка ініціалізації TCP %s: %s", port, err)
 			return
 		}
 		for {
@@ -169,18 +175,16 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 			}()
 		}
 	} else if networkType == "udp" {
-		// Для UDP ми створюємо один "слухач"
 		ln, err := net.ListenPacket("udp", "127.0.0.1:"+port)
 		if err != nil {
-			log.Printf("Помилка прослуховування UDP %s: %s", port, err)
+			log.Printf("Помилка ініціалізації UDP %s: %s", port, err)
 			return
 		}
 
-		// Карта для відстеження активних сесій UDP -> Libp2p Stream
 		sessions := make(map[string]network.Stream)
 		var mu sync.Mutex
-
 		buf := make([]byte, 65535)
+
 		for {
 			n, addr, err := ln.ReadFrom(buf)
 			if err != nil {
@@ -197,7 +201,7 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 					continue
 				}
 				sessions[addrStr] = s
-				// Запускаємо зворотне читання зі стріму в UDP
+
 				go func(remoteAddr net.Addr, stream network.Stream) {
 					respBuf := make([]byte, 65535)
 					for {
