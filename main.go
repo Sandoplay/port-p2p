@@ -78,35 +78,53 @@ func main() {
 }
 
 func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string) peer.ID {
-	fmt.Printf("Публікація та пошук у мережі за ідентифікатором '%s'...\n", secret)
-
+	log.Printf("Початок публікації та пошуку за ідентифікатором: %s", secret)
 	discoveryUtil.Advertise(ctx, rd, secret)
 
 	var targetPeer peer.ID
+	attempt := 1
+
 	for targetPeer == "" {
+		log.Printf("[Спроба %d] Запит FindPeers...", attempt)
 		peerChan, err := rd.FindPeers(ctx, secret)
 		if err != nil {
+			log.Printf("[Спроба %d] Помилка FindPeers: %v", attempt, err)
 			time.Sleep(2 * time.Second)
+			attempt++
 			continue
 		}
 
+		peersFound := 0
 		for p := range peerChan {
-			if p.ID == node.ID() || len(p.Addrs) == 0 {
+			if p.ID == node.ID() {
+				continue
+			}
+			peersFound++
+			log.Printf("Знайдено вузол: %s. Доступні адреси: %v", p.ID, p.Addrs)
+
+			if len(p.Addrs) == 0 {
+				log.Printf("Вузол %s ігнорується (відсутні адреси для підключення)", p.ID)
 				continue
 			}
 
+			log.Printf("Спроба підключення до %s (таймаут 7 сек)...", p.ID)
 			ctxConn, cancel := context.WithTimeout(ctx, 7*time.Second)
 			err := node.Connect(ctxConn, p)
 			cancel()
 
 			if err == nil {
+				log.Printf("УСПІХ: Зв'язок на транспортному рівні з %s встановлено", p.ID)
 				targetPeer = p.ID
 				break
+			} else {
+				log.Printf("ПОМИЛКА підключення до %s: %v", p.ID, err)
 			}
 		}
 
 		if targetPeer == "" {
+			log.Printf("[Спроба %d] Завершено ітерацію. Оброблено знайдених вузлів: %d. Пауза перед повтором...", attempt, peersFound)
 			time.Sleep(2 * time.Second)
+			attempt++
 		}
 	}
 	return targetPeer
