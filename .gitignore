@@ -1,2 +1,3 @@
 .idea/libp2p.iml
 .idea/modules.xml
+go.sum

@@ -42,10 +42,14 @@ func main() {
 
 	// Ініціалізація libp2p вузла
 	node, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",         // Стандартний TCP
+			"/ip4/0.0.0.0/udp/0/quic-v1", // QUIC - критично для пробиття NAT
+		),
 		libp2p.NATPortMap(),
-		libp2p.EnableRelay(),
-		libp2p.EnableHolePunching(),
+		libp2p.EnableRelay(),        // Дозволяє використовувати публічні релеї
+		libp2p.EnableHolePunching(), // Намагається встановити пряме з'єднання
+		libp2p.EnableNATService(),   // ПРАВИЛЬНА НАЗВА замість EnableAutoNAT
 	)
 	if err != nil {
 		log.Fatalf("Помилка створення вузла: %s", err)
@@ -77,12 +81,6 @@ func main() {
 }
 
 func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.RoutingDiscovery, secret string, ports []string) {
-	// Обробник для сигналу привітання (щоб не логувати зайвих пірів)
-	node.SetStreamHandler(protocol.ID("/p2p-tunnel/hello"), func(s network.Stream) {
-		log.Printf(">>> ВАШ ДРУГ ПІДКЛЮЧИВСЯ! (Peer ID: %s)", s.Conn().RemotePeer())
-		s.Close()
-	})
-
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
 		protoID := protocol.ID(fmt.Sprintf("/p2p-tunnel/%s/%s", networkType, port))
@@ -102,6 +100,14 @@ func setupHost(ctx context.Context, node host.Host, rd *routingDiscovery.Routing
 
 	discoveryUtil.Advertise(ctx, rd, secret)
 	fmt.Printf("\n=== СЕРВЕР ЗАПУЩЕНО ===\nСекрет: %s\nПрокидаємо порти: %v\nЧекаємо на клієнта...\n", secret, ports)
+
+	// Додаємо сповіщення про підключення пірів
+	node.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, c network.Conn) {
+			log.Printf(">>> Пір підключився до вас: %s", c.RemotePeer())
+		},
+	})
+
 	select {}
 }
 
@@ -130,12 +136,6 @@ func setupClient(ctx context.Context, node host.Host, rd *routingDiscovery.Routi
 	}
 
 	fmt.Printf("Підключено до друга! (ID: %s)\n", targetPeer)
-
-	// Надсилаємо сигнал "hello" серверу, щоб він знав, що ми тут
-	s, err := node.NewStream(ctx, targetPeer, protocol.ID("/p2p-tunnel/hello"))
-	if err == nil {
-		s.Close()
-	}
 
 	for _, pInfo := range ports {
 		networkType, port, _ := parsePortInfo(pInfo)
@@ -175,7 +175,7 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 			log.Printf("Помилка прослуховування UDP %s: %s", port, err)
 			return
 		}
-		
+
 		// Карта для відстеження активних сесій UDP -> Libp2p Stream
 		sessions := make(map[string]network.Stream)
 		var mu sync.Mutex
@@ -186,7 +186,7 @@ func startLocalListener(ctx context.Context, node host.Host, target peer.ID, net
 			if err != nil {
 				continue
 			}
-			
+
 			addrStr := addr.String()
 			mu.Lock()
 			s, ok := sessions[addrStr]
