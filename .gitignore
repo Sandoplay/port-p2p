@@ -8,3 +8,4 @@ go.sum
 host_key.dat
 .gitignore
 main.exe
+tunnel.exe
