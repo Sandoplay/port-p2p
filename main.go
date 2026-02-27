@@ -32,7 +32,10 @@ type mdnsNotifee struct {
 }
 
 func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	m.peerChan <- pi
+	select {
+	case m.peerChan <- pi:
+	default:
+	}
 }
 
 func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
@@ -129,20 +132,22 @@ func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routi
 	dialCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var wg sync.WaitGroup
-
 	dialPeer := func(p peer.AddrInfo) {
 		if p.ID == node.ID() || len(p.Addrs) == 0 {
 			return
 		}
 
-		wg.Add(1)
 		go func(pi peer.AddrInfo) {
-			defer wg.Done()
+			log.Printf("Ініціалізація підключення до вузла %s...", pi.ID)
 			ctxConn, cancelConn := context.WithTimeout(dialCtx, 7*time.Second)
 			defer cancelConn()
 
 			if err := node.Connect(ctxConn, pi); err == nil {
+				conns := node.Network().ConnsToPeer(pi.ID)
+				if len(conns) > 0 {
+					log.Printf("Фактична адреса віддаленого вузла: %s", conns[0].RemoteMultiaddr())
+				}
+
 				select {
 				case successChan <- pi.ID:
 				default:
@@ -181,6 +186,10 @@ func establishSymmetricConnection(ctx context.Context, node host.Host, rd *routi
 
 	select {
 	case targetPeer = <-successChan:
+		conns := node.Network().ConnsToPeer(targetPeer)
+		if len(conns) > 0 {
+			log.Printf("ТУНЕЛЬ АКТИВНО. Зв'язок на транспортному рівні з %s встановлено", targetPeer)
+		}
 		cancel()
 	case <-ctx.Done():
 	}
